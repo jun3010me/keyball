@@ -19,20 +19,52 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include QMK_KEYBOARD_H
 #include "quantum.h"
 
-// Custom keycode to explicitly escape the auto mouse layer.
-// Place ESC_ML anywhere in your keymap to exit AML on demand.
+// Custom keycodes for escaping the auto mouse layer.
+//   ESC_ML      - exit AML only
+//   ESC_ML_LNG2 - exit AML then tap LNG2 (英数, switch to English input)
+//   ESC_ML_LNG1 - exit AML then tap LNG1 (かな, switch to Japanese input)
 enum my_keycodes {
     ESC_ML = KEYBALL_SAFE_RANGE,
+    ESC_ML_LNG2,
+    ESC_ML_LNG1,
 };
 
+// Deferred LNG key: sent on the next matrix scan after AML exit so that
+// the layer change is fully committed before the HID report is generated.
+static uint8_t pending_lang_key = 0;
+
+void matrix_scan_user(void) {
+    if (pending_lang_key) {
+        tap_code(pending_lang_key);
+        pending_lang_key = 0;
+    }
+}
+
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    if (keycode == ESC_ML) {
-        if (record->event.pressed) {
+    switch (keycode) {
+        case ESC_ML:
+            if (record->event.pressed) {
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
-            keyball_escape_mouse_layer();
+                keyball_escape_mouse_layer();
 #endif
-        }
-        return false;
+            }
+            return false;
+        case ESC_ML_LNG2:
+            if (record->event.pressed) {
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+                keyball_escape_mouse_layer();
+#endif
+                pending_lang_key = KC_LNG2;
+            }
+            return false;
+        case ESC_ML_LNG1:
+            if (record->event.pressed) {
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+                keyball_escape_mouse_layer();
+#endif
+                pending_lang_key = KC_LNG1;
+            }
+            return false;
     }
     return true;
 }
@@ -51,7 +83,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     LGUI(KC_C), LGUI(KC_V), LGUI(KC_X), KC_DEL  , LT(3,KC_NO),                       KC_NO    , KC_BTN1  , LALT(KC_W), KC_ESC   , TG(0)    ,
     KC_NO     , LCTL(KC_C), LCTL(KC_UP), LCTL(KC_V), LCTL(KC_LEFT),                  LCTL(KC_RGHT), KC_BTN1, KC_UP   , KC_BTN2  , TG(1)    ,
     KC_NO     , LCTL(KC_X), KC_NO     , KC_NO    , LCTL(KC_DOWN),                     KC_NO    , KC_LEFT  , KC_DOWN  , KC_RGHT  , TG(1)    ,
-    KC_LCTL   , KC_NO     , KC_NO     , KC_NO    , LT(3,KC_NO), LT(2,KC_NO),          KC_NO    , LT(1,KC_NO), KC_NO  , KC_RALT  , KC_RGUI  , KC_LCTL
+    KC_LCTL   , KC_NO     , KC_NO     , ESC_ML_LNG2, LT(3,KC_NO), ESC_ML_LNG1,        KC_NO    , LT(1,KC_NO), KC_NO  , KC_RALT  , KC_RGUI  , KC_LCTL
   ),
 
   [2] = LAYOUT_universal(
