@@ -33,11 +33,27 @@ const uint16_t AML_TIMEOUT_MIN = 100;
 const uint16_t AML_TIMEOUT_MAX = 1000;
 const uint16_t AML_TIMEOUT_QU  = 50;   // Quantization Unit
 
-const uint16_t AML_ACTIVATE_THRESHOLD = 10;
+// Minimum cumulative |x|+|y| required to activate AML.
+// Raised from 10 → 50 so that accidental light touches don't trigger the layer.
+// The accumulator also resets after AML_NO_MOVE_RESET_MS of zero movement so
+// slow repeated accidental touches can't creep up to the threshold over time.
+const uint16_t AML_ACTIVATE_THRESHOLD  = 50;
+const uint16_t AML_NO_MOVE_RESET_MS    = 500; // ms of no movement before reset
+
+#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
+// Timer for resetting total_mouse_movement after a period of no movement.
+static uint16_t aml_no_move_timer     = 0;
+// Set by keyball_escape_mouse_layer() to suppress AML re-activation for
+// AML_FORCED_EXIT_COOLDOWN ms after ESC_ML is pressed.
+static bool     aml_forced_exit       = false;
+static uint16_t aml_forced_exit_timer = 0;
+#define AML_FORCED_EXIT_COOLDOWN 600
+#endif
 
 static const char BL = '\xB0'; // Blank indicator character
-static const char LFSTR_ON[] PROGMEM = "\xB2\xB3";
+static const char LFSTR_ON[]  PROGMEM = "\xB2\xB3";
 static const char LFSTR_OFF[] PROGMEM = "\xB4\xB5";
+static const char LFSTR_ACT[] PROGMEM = "AC"; // AML currently Active
 
 keyball_t keyball = {
     .this_have_ball = false,
@@ -55,6 +71,7 @@ keyball_t keyball = {
 
     .last_layer_state = 0,
     .total_mouse_movement = 0,
+    .auto_mouse_layer_timeout = AUTO_MOUSE_TIME,
 
     .pressing_keys = { BL, BL, BL, BL, BL, BL, 0 },
 };
@@ -307,29 +324,57 @@ static void keyball_set_auto_mouse_timeout(uint16_t timeout) {
     keyball.auto_mouse_layer_timeout = timeout;
 }
 
-static uint16_t get_auto_mouse_keep_time(void) {
-#ifdef AUTO_MOUSE_LAYER_KEEP_TIME
-        return AUTO_MOUSE_LAYER_KEEP_TIME;
-#else
-        return keyball_get_auto_mouse_timeout();
-#endif
-}
 
 // override qmk function:
 //  https://github.com/qmk/qmk_firmware/blob/0.22.14/quantum/pointing_device/pointing_device_auto_mouse.c#L208-L221
-// activate auto mouse layer when mouse movement exceeds the threshold.
+//
+// Desired behaviour:
+//   - Trackball movement crossing threshold → activate AML, stay indefinitely.
+//   - Mouse button clicks do NOT exit AML (layer stays while active).
+//   - Only ESC_ML (keyball_escape_mouse_layer) explicitly exits AML.
+//
+// Implementation:
+//   While AML layer is active we always return true, keeping QMK's timer.active
+//   reset every debounce tick so the 650ms timeout never fires.
+//   After ESC_ML: aml_forced_exit=true for AML_FORCED_EXIT_COOLDOWN ms, during
+//   which we return false and clear total_mouse_movement so drift can't immediately
+//   re-activate the layer.
 bool auto_mouse_activation(report_mouse_t mouse_report) {
-    keyball.total_mouse_movement += movement_size_of(&mouse_report);
+    // Forced exit: suppress re-activation during cooldown after ESC_ML press.
+    if (aml_forced_exit) {
+        if (timer_elapsed(aml_forced_exit_timer) > AML_FORCED_EXIT_COOLDOWN) {
+            aml_forced_exit = false;
+        } else {
+            keyball.total_mouse_movement = 0;
+            return false;
+        }
+    }
+
+    uint16_t movement = movement_size_of(&mouse_report);
+    if (movement > 0) {
+        // Movement detected: accumulate and reset the no-move timer.
+        aml_no_move_timer = 0;
+        keyball.total_mouse_movement += movement;
+    } else if (!layer_state_is(AUTO_MOUSE_DEFAULT_LAYER)) {
+        // No movement and AML is not active: start/maintain the no-move timer
+        // so repeated accidental touches can't accumulate across pauses.
+        if (aml_no_move_timer == 0) {
+            aml_no_move_timer = timer_read();
+        } else if (timer_elapsed(aml_no_move_timer) > AML_NO_MOVE_RESET_MS) {
+            keyball.total_mouse_movement = 0;
+            aml_no_move_timer = 0;
+        }
+    }
+
     if (AML_ACTIVATE_THRESHOLD < keyball.total_mouse_movement) {
         keyball.total_mouse_movement = 0;
-        if (get_auto_mouse_timeout() != get_auto_mouse_keep_time()) {
-            // keep AML if mouse is moving with "short timeout".
-            set_auto_mouse_timeout(get_auto_mouse_keep_time());
-        }
         return true;
-    } else {
-        return mouse_report.buttons;
     }
+    // While AML is active, keep the layer alive regardless of clicks.
+    if (layer_state_is(AUTO_MOUSE_DEFAULT_LAYER)) {
+        return true;
+    }
+    return mouse_report.buttons;
 }
 #endif
 
@@ -566,10 +611,12 @@ void keyball_oled_render_layerinfo(void) {
 
 #    ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
     oled_write_P(PSTR("\xC2\xC3"), false);
-    if (get_auto_mouse_enable()) {
-        oled_write_P(LFSTR_ON, false);
-    } else {
+    if (!get_auto_mouse_enable()) {
         oled_write_P(LFSTR_OFF, false);
+    } else if (layer_state_is(AUTO_MOUSE_DEFAULT_LAYER)) {
+        oled_write_P(LFSTR_ACT, false);  // AML currently active
+    } else {
+        oled_write_P(LFSTR_ON, false);
     }
 
     oled_write(format_4d(keyball_get_auto_mouse_timeout() / 10) + 1, false);
@@ -634,15 +681,21 @@ void keyball_set_cpi(uint8_t cpi) {
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
 void keyball_handle_auto_mouse_layer_change(layer_state_t state) {
     layer_state_t last_state = keyball.last_layer_state;
-    // go into AML
+    // Reset movement counter on any AML layer transition.
     if (!layer_state_cmp(last_state, AUTO_MOUSE_DEFAULT_LAYER) && layer_state_cmp(state, AUTO_MOUSE_DEFAULT_LAYER)) {
         keyball.total_mouse_movement = 0;
-    } // go out AML
-    else if (layer_state_cmp(last_state, AUTO_MOUSE_DEFAULT_LAYER) && !layer_state_cmp(state, AUTO_MOUSE_DEFAULT_LAYER)) {
-        set_auto_mouse_timeout(get_auto_mouse_keep_time());
+    } else if (layer_state_cmp(last_state, AUTO_MOUSE_DEFAULT_LAYER) && !layer_state_cmp(state, AUTO_MOUSE_DEFAULT_LAYER)) {
         keyball.total_mouse_movement = 0;
     }
     keyball.last_layer_state = state;
+}
+
+void keyball_escape_mouse_layer(void) {
+    layer_off(get_auto_mouse_layer());
+    aml_forced_exit       = true;
+    aml_forced_exit_timer = timer_read();
+    keyball.total_mouse_movement = 0;
+    aml_no_move_timer = 0;
 }
 #endif
 
@@ -734,14 +787,6 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
     if (keycode >= QK_MODS && keycode <= QK_MODS_MAX) {
         keycode &= 0xff;
     }
-
-#ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
-    // reduce auto mouse timeout if mouse key is pressed.
-    if ((is_mouse_record_kb(keycode, record) || IS_MOUSEKEY(keycode)) && record->event.pressed) {
-        set_auto_mouse_timeout(keyball_get_auto_mouse_timeout());
-        keyball.total_mouse_movement = 0;
-    }
-#endif
 
     switch (keycode) {
 #ifndef MOUSEKEY_ENABLE

@@ -277,4 +277,8 @@ void keyball_set_cpi(uint8_t cpi);
 
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
 void keyball_handle_auto_mouse_layer_change(layer_state_t state);
+
+/// keyball_escape_mouse_layer forces the auto mouse layer off and suppresses
+/// re-activation for ~600ms. Call this from your ESC_ML custom keycode handler.
+void keyball_escape_mouse_layer(void);
 #endif
