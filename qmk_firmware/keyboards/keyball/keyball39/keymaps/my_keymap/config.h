@@ -40,3 +40,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define AUTO_MOUSE_TIME 650
 #define DYNAMIC_KEYMAP_LAYER_COUNT 7
 #define AUTO_MOUSE_LAYER_KEEP_TIME 30000
+#define TAPPING_TERM 200
+
+#define SPLIT_TRANSACTION_IDS_USER SYNC_TAPPING_TERM
