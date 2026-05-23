@@ -21,10 +21,38 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "transactions.h"
 #include <avr/eeprom.h>
 
-// Store tapping term at the last 2 bytes of EEPROM (address 1022-1023).
-// This avoids the eeconfig block (0-36) and is far from VIA keymap (41-712)
-// and macro storage (713+), so it survives eeconfig_init() and VIA resets.
-#define TAPPING_TERM_EEPROM_ADDR ((uint16_t *)1022)
+// Custom EEPROM layout for tapping term (outside eeconfig/VIA/keymap areas).
+// Bytes 1020-1021: saved tapping term value (uint16_t)
+// Bytes 1022-1023: magic sentinel — 0xBEEF confirms we wrote these bytes
+// config.h sets DYNAMIC_KEYMAP_EEPROM_MAX_ADDR 1019 so VIA macro reset never touches them.
+#define TT_EEPROM_VAL   ((uint16_t*)1020)
+#define TT_EEPROM_MAGIC ((uint16_t*)1022)
+#define TT_MAGIC_VALUE  0xBEEF
+
+static void tt_save(uint16_t val) {
+    eeprom_update_word(TT_EEPROM_VAL, val);
+    eeprom_update_word(TT_EEPROM_MAGIC, TT_MAGIC_VALUE);
+}
+
+// Set to true when tt_load() successfully reads a valid value from EEPROM.
+// Propagated to slave via sync packet so the slave OLED can show S/D.
+static bool tt_from_eeprom = false;
+
+static uint16_t tt_load(void) {
+    if (eeprom_read_word(TT_EEPROM_MAGIC) == TT_MAGIC_VALUE) {
+        uint16_t v = eeprom_read_word(TT_EEPROM_VAL);
+        if (v >= 50 && v <= 2000) {
+            tt_from_eeprom = true;
+            return v;
+        }
+    }
+    tt_from_eeprom = false;
+    return TAPPING_TERM;
+}
+
+// Sync payload: tapping term + modifier state + EEPROM-load flag (master → slave).
+typedef struct { uint16_t tapping_term; uint8_t mods; uint8_t from_eeprom; } sync_state_t;
+static uint8_t synced_mods = 0;
 
 // Custom keycodes for escaping the auto mouse layer.
 //   ESC_ML      - exit AML only
@@ -46,17 +74,21 @@ void matrix_scan_user(void) {
         pending_lang_key = 0;
     }
 
-#if defined(DYNAMIC_TAPPING_TERM_ENABLE) && defined(SPLIT_KEYBOARD)
+#if defined(SPLIT_KEYBOARD)
     if (is_keyboard_master()) {
-        static uint16_t last_synced = 0;
-        static uint16_t last_saved  = 0;
-        if (g_tapping_term != last_synced) {
-            if (transaction_rpc_send(SYNC_TAPPING_TERM, sizeof(g_tapping_term), &g_tapping_term)) {
-                last_synced = g_tapping_term;
+        static uint16_t last_term = 0;
+        static uint8_t  last_mods = 0xff;
+        static uint16_t last_saved = TAPPING_TERM;
+        uint8_t cur_mods = get_mods() | get_oneshot_mods();
+        if (g_tapping_term != last_term || cur_mods != last_mods) {
+            sync_state_t d = {g_tapping_term, cur_mods, (uint8_t)tt_from_eeprom};
+            if (transaction_rpc_send(SYNC_TAPPING_TERM, sizeof(d), &d)) {
+                last_term = g_tapping_term;
+                last_mods = cur_mods;
             }
         }
         if (g_tapping_term != last_saved) {
-            eeprom_update_word(TAPPING_TERM_EEPROM_ADDR, g_tapping_term);
+            tt_save(g_tapping_term);
             last_saved = g_tapping_term;
         }
     }
@@ -152,10 +184,10 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 // ---------------------------------------------------------------------------
 
 static void sync_tapping_term_slave_handler(uint8_t in_buflen, const void *in_data, uint8_t out_buflen, void *out_data) {
-    g_tapping_term = *(const uint16_t *)in_data;
-#ifdef DYNAMIC_TAPPING_TERM_ENABLE
-    eeprom_update_word(TAPPING_TERM_EEPROM_ADDR, g_tapping_term);
-#endif
+    const sync_state_t *d = (const sync_state_t *)in_data;
+    g_tapping_term = d->tapping_term;
+    synced_mods    = d->mods;
+    tt_from_eeprom = d->from_eeprom;
 }
 
 void keyboard_post_init_user(void) {
@@ -163,9 +195,8 @@ void keyboard_post_init_user(void) {
     set_auto_mouse_layer(1);
     set_auto_mouse_enable(true);
 #ifdef DYNAMIC_TAPPING_TERM_ENABLE
-    uint16_t saved = eeprom_read_word(TAPPING_TERM_EEPROM_ADDR);
-    if (saved >= 50 && saved <= 2000) {
-        g_tapping_term = saved;
+    if (is_keyboard_master()) {
+        g_tapping_term = tt_load();
     }
 #endif
 }
@@ -200,7 +231,7 @@ layer_state_t layer_state_set_user(layer_state_t state) {
 #ifdef OLED_ENABLE
 #    include "lib/oledkit/oledkit.h"
 
-// Right-justify n into a 4-char field, space-padded.
+// Right-justify unsigned 16-bit value in a 4-char space-padded field.
 static void oled_write_num4(uint16_t n) {
     char    buf[5] = "    ";
     uint8_t i      = 4;
@@ -216,47 +247,112 @@ static void oled_write_num4(uint16_t n) {
     oled_write(buf, false);
 }
 
-void oledkit_render_info_user(void) {
-    keyball_oled_render_keyinfo();
-    keyball_oled_render_ballinfo();
-    keyball_oled_render_layerinfo();
+// Lower nibble of x as a hex digit.
+static char nibble_hex(uint8_t x) {
+    x &= 0x0f;
+    return x < 10 ? x + '0' : x + 'a' - 10;
 }
 
-// Override the logo display on the secondary (slave) OLED with
-// keyboard control information that does not fit on the primary OLED.
-void oledkit_render_logo_user(void) {
-    // Row 1: keyboard model identifier
-    oled_write_P(PSTR(" [Keyball 39] "), false);
-    oled_advance_page(false);
+// Both OLEDs mounted vertically, connector pins at the bottom.
+// OLED_ROTATION_270 renders text top-to-bottom in portrait orientation.
+oled_rotation_t oled_init_user(oled_rotation_t rotation) {
+    return OLED_ROTATION_270;
+}
 
-    // Row 2: tapping term — adjustable at runtime via DYNAMIC_TAPPING_TERM
-    oled_write_P(PSTR("Tap:"), false);
-#ifdef DYNAMIC_TAPPING_TERM_ENABLE
-    oled_write_num4(g_tapping_term);
-#else
-    oled_write_num4(TAPPING_TERM);
-#endif
-    oled_write_P(PSTR("ms"), false);
-    oled_advance_page(false);
+// ── Master OLED – key / ball / layer (portrait 5 chars/row) ──────────────────
+// Note: writing exactly 5 chars auto-wraps to the next row via oled_advance_char().
+// Do NOT call oled_advance_page() after a 5-char write — it would skip an extra row.
 
-    // Row 3: RGB hue (changes per layer) + current brightness
-#ifdef RGBLIGHT_ENABLE
-    oled_write_P(PSTR("RGB h"), false);
-    oled_write_num4(rgblight_get_hue());
-    oled_write_P(PSTR(" v"), false);
-    oled_write_num4(rgblight_get_val());
-#else
-    oled_write_P(PSTR("RGB: N/A       "), false);
-#endif
-    oled_advance_page(false);
+void oledkit_render_info_user(void) {
+    // Row 0: key position  "R?C? "
+    oled_write_char('R', false);
+    oled_write_char(nibble_hex(keyball.last_pos.row), false);
+    oled_write_char('C', false);
+    oled_write_char(nibble_hex(keyball.last_pos.col), false);
+    oled_write_char(' ', false);
 
-    // Row 4: scroll divider + auto mouse layer activation timeout
-    oled_write_P(PSTR("Div:"), false);
-    oled_write_char('0' + keyball_get_scroll_div(), false);
+    // Row 1: keycode  "K??  "
+    oled_write_char('K', false);
+    oled_write_char(nibble_hex(keyball.last_kc >> 4), false);
+    oled_write_char(nibble_hex(keyball.last_kc), false);
+    oled_write_P(PSTR("  "), false);
+
+    // Row 2: pressing keys (always exactly 5 chars)
+    for (uint8_t i = 0; i < 5; i++) oled_write_char(keyball.pressing_keys[i], false);
+
+    // Rows 3-4: ball x, y  "x NNN" / "y NNN"
+#define WB(label, val) do { \
+    int8_t _v = (val); \
+    oled_write_char((label), false); \
+    oled_write_num4((uint16_t)(_v < 0 ? -(int)_v : (int)_v)); \
+} while (0)
+    WB('x', keyball.last_mouse.x);
+    WB('y', keyball.last_mouse.y);
+#undef WB
+
+    // Row 5: CPI  "CXX00"
+    {
+        uint8_t c = keyball_get_cpi();
+        oled_write_char('C', false);
+        oled_write_char(c >= 10 ? '0' + (c / 10) : ' ', false);
+        oled_write_char('0' + (c % 10), false);
+        oled_write_P(PSTR("00"), false);
+    }
+
+    // Row 6: layer  "L:N  "
+    oled_write_char('L', false);
+    oled_write_char(':', false);
+    oled_write_char('0' + get_highest_layer(layer_state), false);
+    oled_write_P(PSTR("  "), false);
+
+    // Rows 7-8: AML status and timeout
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
-    oled_write_P(PSTR("  AML:"), false);
+    if (!get_auto_mouse_enable()) {
+        oled_write_P(PSTR("AmOff"), false);
+    } else if (layer_state_is(AUTO_MOUSE_DEFAULT_LAYER)) {
+        oled_write_P(PSTR("Am:AC"), false);
+    } else {
+        oled_write_P(PSTR("Am:On"), false);
+    }
+    oled_write_char('a', false);
     oled_write_num4(keyball.auto_mouse_layer_timeout);
 #endif
-    oled_advance_page(false);
+}
+
+// ── Slave OLED – settings + modifier display (portrait 5 chars/row) ──────────
+
+void oledkit_render_logo_user(void) {
+    // Row 0: keyboard label
+    oled_write_P(PSTR(" K39 "), false);
+
+    // Row 1: tapping term label
+    oled_write_P(PSTR(" Tap "), false);
+
+    // Row 2: tapping term  " NNNS" (S=loaded from EEPROM, D=firmware default)
+    oled_write_num4(g_tapping_term);
+    oled_write_char(tt_from_eeprom ? 'S' : 'D', false);
+
+    // Rows 3-5: RGB info
+#ifdef RGBLIGHT_ENABLE
+    oled_write_P(PSTR(" RGB "), false);
+    oled_write_char('h', false);
+    oled_write_num4(rgblight_get_hue());
+    oled_write_char('v', false);
+    oled_write_num4(rgblight_get_val());
+#else
+    oled_write_P(PSTR(" RGB "), false);
+    oled_write_P(PSTR(" N/A "), false);
+    oled_write_P(PSTR("     "), false);
+#endif
+
+    // Rows 6-9: modifier keys – inverted when pressed
+    oled_write_P(PSTR("Ctrl "), (bool)(synced_mods & MOD_MASK_CTRL));
+    oled_write_P(PSTR("Shft "), (bool)(synced_mods & MOD_MASK_SHIFT));
+    oled_write_P(PSTR(" Alt "), (bool)(synced_mods & MOD_MASK_ALT));
+    oled_write_P(PSTR(" GUI "), (bool)(synced_mods & MOD_MASK_GUI));
+
+    // Row 10: scroll divisor
+    oled_write_P(PSTR("Div:"), false);
+    oled_write_char('0' + keyball_get_scroll_div(), false);
 }
 #endif

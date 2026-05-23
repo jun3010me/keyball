@@ -43,3 +43,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define TAPPING_TERM 200
 
 #define SPLIT_TRANSACTION_IDS_USER SYNC_TAPPING_TERM
+
+// Tapping term is stored at bytes 1020-1023 (value + 0xBEEF magic).
+// Cap VIA macro storage at 1019 so dynamic_keymap_macro_reset() never zeroes those bytes.
+#define DYNAMIC_KEYMAP_EEPROM_MAX_ADDR 1019
+
