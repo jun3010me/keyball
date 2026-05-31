@@ -259,6 +259,39 @@ oled_rotation_t oled_init_user(oled_rotation_t rotation) {
     return OLED_ROTATION_270;
 }
 
+// Bitmap tables – each byte: bit4=col0(left) … bit0=col4(right).
+// Layer digits: 7 digits × 6 rows (1 leading blank row for vertical centering).
+static const uint8_t PROGMEM big_digit_data[7][6] = {
+    { 0, 14, 10, 10, 10, 14}, // 0
+    { 0,  4, 12,  4,  4, 14}, // 1
+    { 0, 14,  2, 14,  8, 14}, // 2
+    { 0, 14,  2, 14,  2, 14}, // 3
+    { 0, 10, 10, 14,  2,  2}, // 4
+    { 0, 14,  8, 14,  2, 14}, // 5
+    { 0, 14,  8, 14, 10, 14}, // 6
+};
+// Modifier letters C/S/A/G: 4 letters × 7 rows (2 leading blank rows for vertical centering).
+static const uint8_t PROGMEM mod_letter_data[4][7] = {
+    { 0,  0, 14,  8,  8,  8, 14},  // C
+    { 0,  0, 14,  8, 14,  2, 14},  // S
+    { 0,  0,  4, 10, 14, 10, 10},  // A
+    { 0,  0, 14,  8, 14, 10, 14},  // G
+};
+
+// Renders a 5-wide bitmap from PROGMEM over `rows` display rows.
+// Blank rows (data byte = 0) are never inverted, keeping them dark regardless of pressed.
+static void oled_write_big_bitmap(const uint8_t *data, uint8_t rows, bool pressed) {
+    for (uint8_t r = 0; r < rows; r++, data++) {
+        uint8_t b = pgm_read_byte(data);
+        bool inv = pressed && b;
+        uint8_t m = 0x10;
+        for (uint8_t c = 0; c < 5; c++) {
+            oled_write_char(b & m ? '#' : ' ', inv);
+            m >>= 1;
+        }
+    }
+}
+
 // ── Master OLED – key / ball / layer (portrait 5 chars/row) ──────────────────
 // Note: writing exactly 5 chars auto-wraps to the next row via oled_advance_char().
 // Do NOT call oled_advance_page() after a 5-char write — it would skip an extra row.
@@ -290,22 +323,11 @@ void oledkit_render_info_user(void) {
     WB('y', keyball.last_mouse.y);
 #undef WB
 
-    // Row 5: CPI  "CXX00"
-    {
-        uint8_t c = keyball_get_cpi();
-        oled_write_char('C', false);
-        oled_write_char(c >= 10 ? '0' + (c / 10) : ' ', false);
-        oled_write_char('0' + (c % 10), false);
-        oled_write_P(PSTR("00"), false);
-    }
+    // Row 5: CPI  "CNNNN"
+    oled_write_char('C', false);
+    oled_write_num4((uint16_t)keyball_get_cpi() * 100);
 
-    // Row 6: layer  "L:N  "
-    oled_write_char('L', false);
-    oled_write_char(':', false);
-    oled_write_char('0' + get_highest_layer(layer_state), false);
-    oled_write_P(PSTR("  "), false);
-
-    // Rows 7-8: AML status and timeout
+    // Rows 6-7: AML status and timeout
 #ifdef POINTING_DEVICE_AUTO_MOUSE_ENABLE
     if (!get_auto_mouse_enable()) {
         oled_write_P(PSTR("AmOff"), false);
@@ -317,42 +339,36 @@ void oledkit_render_info_user(void) {
     oled_write_char('a', false);
     oled_write_num4(keyball.auto_mouse_layer_timeout);
 #endif
+
+    // Rows 8-15: layer digit (1 blank + 5 digit + 2 blank = centered in 8 rows)
+    {
+        uint8_t l = get_highest_layer(layer_state);
+        if (l < 7) oled_write_big_bitmap(big_digit_data[l], 6, false);
+    }
 }
 
-// ── Slave OLED – settings + modifier display (portrait 5 chars/row) ──────────
-
+// ── Slave OLED – tapping term / modifier status / active modifier big (portrait 5 chars/row)
 void oledkit_render_logo_user(void) {
-    // Row 0: keyboard label
-    oled_write_P(PSTR(" K39 "), false);
-
-    // Row 1: tapping term label
+    oled_clear();
+    // Row 0: " Tap "
     oled_write_P(PSTR(" Tap "), false);
-
-    // Row 2: tapping term  " NNNS" (S=loaded from EEPROM, D=firmware default)
+    // Row 1: tapping term value + S(aved)/D(efault) flag
     oled_write_num4(g_tapping_term);
     oled_write_char(tt_from_eeprom ? 'S' : 'D', false);
-
-    // Rows 3-5: RGB info
-#ifdef RGBLIGHT_ENABLE
-    oled_write_P(PSTR(" RGB "), false);
-    oled_write_char('h', false);
-    oled_write_num4(rgblight_get_hue());
-    oled_write_char('v', false);
-    oled_write_num4(rgblight_get_val());
-#else
-    oled_write_P(PSTR(" RGB "), false);
-    oled_write_P(PSTR(" N/A "), false);
-    oled_write_P(PSTR("     "), false);
-#endif
-
-    // Rows 6-9: modifier keys – inverted when pressed
-    oled_write_P(PSTR("Ctrl "), (bool)(synced_mods & MOD_MASK_CTRL));
-    oled_write_P(PSTR("Shft "), (bool)(synced_mods & MOD_MASK_SHIFT));
-    oled_write_P(PSTR(" Alt "), (bool)(synced_mods & MOD_MASK_ALT));
-    oled_write_P(PSTR(" GUI "), (bool)(synced_mods & MOD_MASK_GUI));
-
-    // Row 10: scroll divisor
+    // Rows 2-5: compact modifier icons (inverted when pressed)
+    uint8_t mods = synced_mods;
+    oled_write_P(PSTR("Ctrl "), mods & MOD_MASK_CTRL);
+    oled_write_P(PSTR("Shift"), mods & MOD_MASK_SHIFT);
+    oled_write_P(PSTR("Alt  "), mods & MOD_MASK_ALT);
+    oled_write_P(PSTR("GUI  "), mods & MOD_MASK_GUI);
+    // Row 6: scroll divisor
     oled_write_P(PSTR("Div:"), false);
     oled_write_char('0' + keyball_get_scroll_div(), false);
+    // Rows 7-15: modifier letter (2 blank + 5 letter + 2 blank = centered in 9 rows)
+    uint8_t m = (mods & MOD_MASK_CTRL)  ? 0 :
+                (mods & MOD_MASK_SHIFT) ? 1 :
+                (mods & MOD_MASK_ALT)   ? 2 :
+                (mods & MOD_MASK_GUI)   ? 3 : 0xFF;
+    if (m < 4) oled_write_big_bitmap(mod_letter_data[m], 7, true);
 }
 #endif
